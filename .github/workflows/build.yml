@@ -51,7 +51,7 @@ jobs:
       - name: Graft device support + convert switch to DSA
         run: |
           cd "$OPENWRT_PATH"
-          "$GITHUB_WORKSPACE/scripts/diy.sh"
+          bash "$GITHUB_WORKSPACE/scripts/diy.sh"
 
       - name: Update & install feeds (official only)
         run: |
