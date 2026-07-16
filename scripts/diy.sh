@@ -29,7 +29,8 @@ echo ">> Converting RTL8366UB swconfig driver -> DSA (kernel 6.12 API)"
 
 # Ported DSA driver + build the DSA object instead of the swconfig one
 cp "$WORKSPACE/files/dsa/rtl8366ub_dsa.c" "$RTLPKG/src/rtl8366ub_dsa.c"
-sed -i 's#^rtl8366ub-y += rtl8366ub_mdio.o#rtl8366ub-y += rtl8366ub_dsa.o\\nrtl8366ub-y += l2.o#' "$RTLPKG/src/Makefile"
+sed -i 's#^rtl8366ub-y += rtl8366ub_mdio.o#rtl8366ub-y += rtl8366ub_dsa.o#' "$RTLPKG/src/Makefile"
+sed -i '/^rtl8366ub-y += rtl8366ub_dsa.o/a rtl8366ub-y += l2.o' "$RTLPKG/src/Makefile"
 
 # Drop the swconfig package dependency (DSA core + tagger are in-kernel)
 sed -i 's#DEPENDS:=@TARGET_mediatek +kmod-swconfig#DEPENDS:=@TARGET_mediatek#' "$RTLPKG/Makefile"
@@ -73,4 +74,5 @@ exit 0
 UCI
 
 echo ">> DSA conversion applied"
+
 
