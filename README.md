@@ -46,8 +46,13 @@ It contains:
 - This driver is a **fork-only** solution. Mainline OpenWrt wants the RTL8371C
   added to the existing `rtl8365mb` driver instead of vendoring GL's SDK
   (see the discussion on PR #24237). This repo prioritizes a *working image now*.
-- MediaTek PPE cannot hardware-offload DSA-tagged (`rtl8_4`) LAN flows, so
-  LAN↔WAN NAT is CPU-bound (~1.5–2.3 Gbps), not 2.5G line rate.
+- MediaTek's PPE hardware flow-offload only supports MediaTek's own DSA tag
+  (`DSA_TAG_PROTO_MTK`); it rejects the Realtek `rtl8_4` tag
+  (`mtk_ppe_offload.c`: `if (proto != DSA_TAG_PROTO_MTK) return -ENODEV`).
+  So **routed LAN↔WAN flows run on the CPU** with software flow-offload rather
+  than the PPE — a hardware limitation of the Realtek-switch + MediaTek-SoC
+  pairing, not fixable in software. Actual NAT throughput is unmeasured.
+  LAN↔LAN switching stays in the switch hardware and is unaffected.
 
 ## Layout
 
@@ -58,3 +63,4 @@ config/mt5000.config          lean seed .config
 files/dsa/rtl8366ub_dsa.c     DSA driver (ported 5.4 -> 6.12)
 files/dsa/mt7987a-gl-mt5000.dts  DSA device tree
 ```
+
