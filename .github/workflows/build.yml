@@ -87,8 +87,8 @@ jobs:
         run: |
           cd "$OPENWRT_PATH"
           mkdir -p "$GITHUB_WORKSPACE/artifact"
-          find bin/targets -type f \( -name '*sysupgrade.bin' -o -name '*initramfs*.bin' \
-            -o -name '*.manifest' -o -name 'config.buildinfo' \) \
+          find bin/targets -type f \( -name '*sysupgrade.bin' -o -name '*factory.bin' \
+            -o -name '*initramfs*.bin' -o -name '*.manifest' -o -name 'config.buildinfo' \) \
             -exec cp {} "$GITHUB_WORKSPACE/artifact/" \; || true
           cp .config "$GITHUB_WORKSPACE/artifact/resolved.config" || true
           ls -la "$GITHUB_WORKSPACE/artifact/" || true

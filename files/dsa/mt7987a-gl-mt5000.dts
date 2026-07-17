@@ -50,19 +50,30 @@
 	leds {
 		compatible = "gpio-leds";
 
-		led_power: led@0 {
-			label = "blue:run";
+		/* color/function bindings (dt-bindings/leds/common.h, already pulled
+		 * in by mt7987a.dtsi line 8) replace the deprecated combined label=
+		 * form; led-N node names drop the unit-address-without-reg dtc W=1
+		 * warning. The led_power phandle is preserved for the
+		 * led-boot/failsafe/running/upgrade aliases. */
+		led_power: led-0 {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_POWER;
 			gpios = <&pio 44 GPIO_ACTIVE_LOW>;
 			default-state = "on";
 		};
 
-		led@1 {
-			label = "white:system";
+		led-1 {
+			color = <LED_COLOR_ID_WHITE>;
+			function = LED_FUNCTION_STATUS;
 			gpios = <&pio 7 GPIO_ACTIVE_LOW>;
 		};
 
-		led@2 {
-			label = "vpn";
+		led-2 {
+			/* colour is a best-guess placeholder: the physical VPN LED
+			 * colour is undocumented in the sources; it only affects the
+			 * cosmetic sysfs name (green:vpn). Verify on hardware. */
+			color = <LED_COLOR_ID_GREEN>;
+			function = "vpn";
 			gpios = <&pio 43 GPIO_ACTIVE_LOW>;
 		};
 	};
@@ -124,6 +135,19 @@
 						#address-cells = <1>;
 						#size-cells = <1>;
 
+						/*
+						 * GL flashes the board MAC at offset 0x4000 within the
+						 * "factory" partition (matches GL's PR DTS,
+						 * glpr/mt5000_orig.dts). Do NOT change this to 0x4: that
+						 * is the generic MediaTek reference-board Factory MAC
+						 * offset and does not apply to GL-flashed units (reading
+						 * 0x4 yields the wrong/zero MAC). Per-port MACs derive via
+						 * #nvmem-cell-cells=1: cell 0 = base (gmac0), cell 1 =
+						 * base+1 (gmac1/WAN). label-mac-device = &gmac0 also
+						 * matches GL's PR and is inert here: both gmac0 and gmac1
+						 * already carry explicit nvmem-cells, so nothing relies on
+						 * the label fallback.
+						 */
 						macaddr_base: macaddr@4000 {
 							compatible = "mac-base";
 							reg = <0x4000 0x6>;
@@ -180,12 +204,37 @@
 	switch@0 {
 		compatible = "realtek,rtl8366ub";
 		reg = <0>;
+		/*
+		 * ACTIVE_HIGH is REQUIRED here and must NOT be "corrected" to
+		 * GPIO_ACTIVE_LOW. This GL driver's rtl8366ub_sw_setup() drives the
+		 * reset line gpiod_set_value(0) -> delay -> gpiod_set_value(1) and
+		 * then reads the chip ID, i.e. it holds the line at logical 1 while
+		 * accessing the switch. With ACTIVE_HIGH the raw pin ends HIGH,
+		 * releasing the RTL8371C's active-low RST_N (matches GL's shipping
+		 * swconfig DTS, where pio 42 uses flag 0 = ACTIVE_HIGH). Mainline
+		 * rtl83xx.c does the opposite (assert=1, ends deasserted=0); flipping
+		 * this node to ACTIVE_LOW would hold RST_N asserted during probe and
+		 * the chip-ID read fails -> the switch never registers (boot-breaker).
+		 */
 		reset-gpios = <&pio 42 GPIO_ACTIVE_HIGH>;
 
 		ports {
 			#address-cells = <1>;
 			#size-cells = <0>;
 
+			/*
+			 * User ports carry the RTL8371C's integrated 2.5G copper PHYs
+			 * and deliberately have NO phy-handle: DSA auto-creates
+			 * ds->user_mii_bus from this driver's .phy_read/.phy_write and
+			 * attaches generic C22 phylib at MDIO addr == port index (0,1),
+			 * gated by phys_mii_mask = BIT(0)|BIT(1). C22 genphy tops out at
+			 * 1000BASE-T, but rtl8366ub_sw_phylink_mac_link_up() reads the
+			 * chip's resolved speed (rtk_port_phyStatus_get) and forces the
+			 * switch MAC to the real rate, so lan1/lan2 still reach 2.5G. Do
+			 * NOT add a phy-handle: there is no host-mdio-bus PHY at addr 0/1
+			 * (addr 0 is switch@0 itself, addr 15 is the WAN c45 PHY); the
+			 * user PHYs live behind the switch's indirect SMI.
+			 */
 			port@0 {
 				reg = <0>;
 				label = "lan1";

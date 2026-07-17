@@ -39,6 +39,17 @@ sed -i 's#DEPENDS:=@TARGET_mediatek +kmod-swconfig#DEPENDS:=@TARGET_mediatek#' "
 # devices' recipes that legitimately use swconfig, e.g. mercusys_mr85x)
 sed -i '/^define Device\/glinet_gl-mt5000$/,/^endef$/{s/ kmod-rtl8366ub-mdio//g; s/ swconfig\b//g}' "$FILOGIC_MK"
 
+# GL's grafted gl-mt5000 recipe finalises its sysupgrade image with the
+# GL-fork-only `append-gl-metadata` macro, which is UNDEFINED in vanilla
+# openwrt-25.12 (only `append-metadata` exists). Make silently expands the
+# undefined pipe stage to nothing, so the build succeeds but sysupgrade.bin
+# ships WITHOUT its metadata trailer; the device (REQUIRE_IMAGE_METADATA=1 in
+# platform.sh) then REJECTS it on flash ("Image metadata not found"). Convert
+# to the stock append-metadata, scoped to this one recipe so no other device
+# (including any GL sibling that legitimately uses append-gl-metadata) is
+# touched.
+sed -i '/^define Device\/glinet_gl-mt5000$/,/^endef$/{s/append-gl-metadata/append-metadata/g}' "$FILOGIC_MK"
+
 # DSA device tree (switch as an mdio child, per-port user netdevs + cpu@17)
 cp "$WORKSPACE/files/dsa/mt7987a-gl-mt5000.dts" target/linux/mediatek/dts/mt7987a-gl-mt5000.dts
 
@@ -50,6 +61,23 @@ perl -0pi -e 's/(ucidef_set_interfaces_lan_wan eth0 eth1\n)\s*glinet,gl-mt5000\)
 # Enable the RTL8_4 DSA tagger in the kernel config
 grep -q "CONFIG_NET_DSA_TAG_RTL8_4=y" "$KCFG" || echo "CONFIG_NET_DSA_TAG_RTL8_4=y" >> "$KCFG"
 
+# The grafted PR #24237 platform.sh lists glinet,gl-mt5000 in platform_do_upgrade
+# (the emmc_do_upgrade case) but OMITS it from platform_copy_config, unlike its
+# eMMC siblings (glinet,gl-mt6000 etc). On an eMMC device that means a
+# config-preserving `sysupgrade` never calls emmc_copy_config, so saved
+# /etc/config is silently dropped after the rootfs is rewritten. Add it, scoped
+# to the copy_config case and made idempotent so a re-run or a future fixed PR
+# does not double-insert. The mt2500-airoha->mt6000 pair is unique to
+# platform_copy_config (in platform_do_upgrade mt5000 already sits between them).
+UPGRADE_SH=target/linux/mediatek/filogic/base-files/lib/upgrade/platform.sh
+test -f "$UPGRADE_SH" || { echo ">> ERROR: $UPGRADE_SH missing (tree layout changed?)"; exit 1; }
+if ! sed -n '/^platform_copy_config()/,/^}/p' "$UPGRADE_SH" | grep -q 'glinet,gl-mt5000'; then
+    perl -0pi -e 's/\tglinet,gl-mt2500-airoha\|\\\n\tglinet,gl-mt6000\|\\/\tglinet,gl-mt2500-airoha|\\\n\tglinet,gl-mt5000|\\\n\tglinet,gl-mt6000|\\/' "$UPGRADE_SH"
+    sed -n '/^platform_copy_config()/,/^}/p' "$UPGRADE_SH" | grep -q 'glinet,gl-mt5000' \
+        || { echo ">> ERROR: failed to add gl-mt5000 to platform_copy_config (config would be lost on sysupgrade)"; exit 1; }
+    echo ">> platform_copy_config: gl-mt5000 added"
+fi
+
 # --- 3. Sanity gates (each can actually fail) ------------------------------
 grep -q "rtl8366ub_dsa.o" "$RTLPKG/src/Makefile" || { echo ">> ERROR: DSA object not wired into src/Makefile"; exit 1; }
   grep -q "^rtl8366ub-y += l2.o" "$RTLPKG/src/Makefile" || { echo ">> ERROR: l2.o not wired (F7 fdb/learning/fast-age need rtksw_l2_*)"; exit 1; }
@@ -59,6 +87,11 @@ grep -q 'glinet,gl-mt5000)' "$BOARDD" || { echo ">> ERROR: gl-mt5000 case missin
 if grep -q '17@eth0' "$BOARDD"; then echo ">> ERROR: stale swconfig ucidef_add_switch survived"; exit 1; fi
 sh -n "$BOARDD" || { echo ">> ERROR: board.d/02_network has a shell syntax error"; exit 1; }
 if grep -q 'kmod-rtl8366ub-mdio' "$FILOGIC_MK"; then echo ">> ERROR: nonexistent kmod-rtl8366ub-mdio still in DEVICE_PACKAGES"; exit 1; fi
+# The gl-mt5000 sysupgrade image must carry standard OpenWrt metadata or the
+# device refuses it on flash. Gates SCOPED to the recipe range so GL sibling
+# recipes that legitimately use append-gl-metadata never trip them.
+if sed -n '/^define Device\/glinet_gl-mt5000$/,/^endef$/p' "$FILOGIC_MK" | grep -q 'append-gl-metadata'; then echo ">> ERROR: GL-fork-only append-gl-metadata survived in the gl-mt5000 recipe; sysupgrade.bin would build without a metadata trailer and be rejected on flash"; exit 1; fi
+if ! sed -n '/^define Device\/glinet_gl-mt5000$/,/^endef$/p' "$FILOGIC_MK" | grep -qF 'sysupgrade-tar | append-metadata'; then echo ">> ERROR: gl-mt5000 sysupgrade.bin append-metadata conversion did not take"; exit 1; fi
 
 # --- 4. First-boot defaults ------------------------------------------------
 mkdir -p files/etc/uci-defaults

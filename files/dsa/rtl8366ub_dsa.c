@@ -21,6 +21,7 @@
 #include <linux/bitops.h>
 #include <linux/regmap.h>
 #include <linux/phylink.h>
+#include <linux/ethtool.h>
 #include <net/dsa.h>
 #include <net/switchdev.h>
 #include <linux/gpio/consumer.h>
@@ -30,6 +31,7 @@
 #include "vlan.h"
 #include "cpu.h"
 #include "l2.h"
+#include "stat.h"
 #include "rtl8366ub_dsa.h"
 #include "dal/smi.h"
 
@@ -102,8 +104,16 @@ static int rtl8366ub_cpu_mac_config(struct dsa_switch *ds, rtksw_port_t port,
             break;
         default:
             dev_err(priv->dev, "phy mode %d not supported for CPU port\n", phy_mode);
+            return -EINVAL;
     }
-    rtk_port_macForceLinkExt_set(port, mode_ext, &mac_cfg);
+    /* Propagate the write result: this forces the CPU/ext MAC link and is a
+     * load-bearing step - if it silently fails, setup() must not go on to
+     * report success (see the caller, which now checks this return).
+     */
+    if (rtk_port_macForceLinkExt_set(port, mode_ext, &mac_cfg) != RT_ERR_OK) {
+        dev_err(priv->dev, "failed to force CPU port ext MAC link\n");
+        return -EIO;
+    }
     return 0;
 }
 
@@ -162,6 +172,22 @@ static int rtl8366ub_sw_setup(struct dsa_switch *ds)
         dev_err(priv->dev, "rtk_vlan_init failed\n");
         return -EIO;
     }
+    /*
+     * The L2 module has its own init that the switch/vlan inits do NOT run:
+     * dal_rtl8371c_switch_init() touches none of the L2 config, and the
+     * driver never called rtk_l2_init(). Yet it drives rtk_l2_addr_add/del,
+     * rtk_l2_ucastAddr_flush and rtk_l2_limitLearningCnt_set - the SDK header
+     * explicitly says "Initialize l2 module before calling any l2 APIs".
+     * rtk_l2_init() sets a sane LUT aging time (300 s), enables the exact-
+     * match CAM (BCAM_DISABLE=0) and selects MAC-based multicast lookup;
+     * without it those stay at power-on register defaults, so dynamic FDB on
+     * the bridged trunk ages at an undefined rate (stale entries or constant
+     * unknown-unicast flooding on the LAN).
+     */
+    if (rtk_l2_init() != RT_ERR_OK) {
+        dev_err(priv->dev, "rtk_l2_init failed\n");
+        return -EIO;
+    }
 
     RTKSW_PORTMASK_CLEAR(portmask);
     for (i = 0; i < RTL8366UB_NUM_PORTS; i++) {
@@ -179,6 +205,17 @@ static int rtl8366ub_sw_setup(struct dsa_switch *ds)
          * bridge requests vlan_filtering=1.
          */
         rtk_vlan_portIgrFilterEnable_set(i, RTKSW_DISABLED);
+
+        /*
+         * DSA model: a standalone (non-bridged) port must not learn source
+         * MACs; learning is turned on per-port by .port_bridge_flags only
+         * when the port joins a bridge with BR_LEARNING set (and turned off
+         * again on leave). rtk_l2_init() above left every port's auto-learn
+         * limit at the chip maximum (learning ON), so clear it here
+         * (0 == learning disabled), mirroring the in-tree rtl8365mb setup
+         * (rtl8365mb_port_set_learning(.., false) for every port).
+         */
+        rtk_l2_limitLearningCnt_set(i, 0);
     }
     rtk_port_isolation_set(EXT_PORT0, &portmask);
     rtk_port_isolation_set(priv->cpu_port, &portmask);
@@ -193,11 +230,41 @@ static int rtl8366ub_sw_setup(struct dsa_switch *ds)
      */
     rtk_vlan_portIgrFilterEnable_set(priv->cpu_port, RTKSW_DISABLED);
 
-    rtl8366ub_cpu_mac_config(ds, priv->cpu_port, interface);
-    rtk_cpu_tagPort_set(priv->cpu_port, CPU_INSERT_TO_ALL);
-    rtk_cpu_enable_set(RTKSW_ENABLED);
+    ret = rtl8366ub_cpu_mac_config(ds, priv->cpu_port, interface);
+    if (ret) {
+        dev_err(priv->dev, "CPU port MAC config failed\n");
+        return ret;
+    }
 
-    rtk_port_phyEnableAll_set(RTKSW_ENABLED);
+    /* CPU tag insertion + CPU-port enable are load-bearing: if either write
+     * fails, gmac0 never sees correctly rtl8_4-tagged frames and the whole
+     * gateway goes dark. Fail registration (so DSA unwinds) instead of
+     * booting a switch that answers to nothing. Mirrors rtl8365mb, which
+     * checks every setup-time register write.
+     */
+    if (rtk_cpu_tagPort_set(priv->cpu_port, CPU_INSERT_TO_ALL) != RT_ERR_OK ||
+        rtk_cpu_enable_set(RTKSW_ENABLED) != RT_ERR_OK) {
+        dev_err(priv->dev, "failed to enable CPU tag port\n");
+        return -EIO;
+    }
+
+    if (rtk_port_phyEnableAll_set(RTKSW_ENABLED) != RT_ERR_OK) {
+        dev_err(priv->dev, "failed to enable PHYs\n");
+        return -EIO;
+    }
+
+    /*
+     * Start every user port administratively down (STP DISABLED) so it does
+     * not forward frames to the CPU before it has been brought up. DSA moves
+     * each port to BR_STATE_FORWARDING from dsa_port_enable() on .ndo_open
+     * (and to DISABLED on close), so this is safe and does not strand a port.
+     * Mirrors the in-tree rtl8365mb setup, whose comment notes ports would
+     * otherwise still forward to the CPU despite being down by default. The
+     * CPU/ext port is intentionally left untouched (stays forwarding).
+     */
+    for (i = 0; i < RTL8366UB_NUM_PORTS; i++)
+        rtk_stp_mstpState_set(0, i, RTKSW_STP_STATE_DISABLED);
+
     return 0;
 }
 
@@ -746,6 +813,82 @@ static int rtl8366ub_sw_port_max_mtu(struct dsa_switch *ds, int port)
 }
 
 /*
+ * Per-port hardware MIB counters exposed through ethtool -S, mirroring the
+ * in-tree Realtek DSA drivers (rtl8365mb/rtl8366rb). The SDK's stat module is
+ * compiled into the module (stat.o + dal/rtl8371c/dal_rtl8371c_stat.o), and
+ * rtk_stat_port_get() L2P-maps the port internally. These ops run in process
+ * (rtnl) context, where the SDK's sleeping MDIO access is legal; reg_mutex is
+ * held to match the driver's locking. get_stats64 is deliberately NOT provided:
+ * it runs in atomic context and the SDK MDIO path sleeps.
+ */
+struct rtl8366ub_mib_counter {
+    const char *name;
+    rtksw_stat_port_type_t idx;
+};
+
+static const struct rtl8366ub_mib_counter rtl8366ub_mib_counters[] = {
+    { "IfInOctets",              STAT_IfInOctets },
+    { "IfInUcastPkts",           STAT_IfInUcastPkts },
+    { "IfInMulticastPkts",       STAT_IfInMulticastPkts },
+    { "IfInBroadcastPkts",       STAT_IfInBroadcastPkts },
+    { "Dot3StatsFCSErrors",      STAT_Dot3StatsFCSErrors },
+    { "Dot3StatsSymbolErrors",   STAT_Dot3StatsSymbolErrors },
+    { "EtherStatsDropEvents",    STAT_EtherStatsDropEvents },
+    { "EtherStatsUnderSizePkts", STAT_EtherStatsUnderSizePkts },
+    { "EtherOversizeStats",      STAT_EtherOversizeStats },
+    { "EtherStatsFragments",     STAT_EtherStatsFragments },
+    { "EtherStatsJabbers",       STAT_EtherStatsJabbers },
+    { "Dot3InPauseFrames",       STAT_Dot3InPauseFrames },
+    { "IfOutOctets",             STAT_IfOutOctets },
+    { "IfOutUcastPkts",          STAT_IfOutUcastPkts },
+    { "IfOutMulticastPkts",      STAT_IfOutMulticastPkts },
+    { "IfOutBroadcastPkts",      STAT_IfOutBroadcastPkts },
+    { "EtherStatsCollisions",    STAT_EtherStatsCollisions },
+    { "Dot3OutPauseFrames",      STAT_Dot3OutPauseFrames },
+    { "IfOutDiscards",           STAT_IfOutDiscards },
+};
+
+#define RTL8366UB_MIB_COUNT ARRAY_SIZE(rtl8366ub_mib_counters)
+
+static void rtl8366ub_sw_get_strings(struct dsa_switch *ds, int port,
+                                     u32 stringset, u8 *data)
+{
+    unsigned int i;
+
+    if (stringset != ETH_SS_STATS)
+        return;
+
+    for (i = 0; i < RTL8366UB_MIB_COUNT; i++)
+        ethtool_puts(&data, rtl8366ub_mib_counters[i].name);
+}
+
+static int rtl8366ub_sw_get_sset_count(struct dsa_switch *ds, int port, int sset)
+{
+    if (sset != ETH_SS_STATS)
+        return -EOPNOTSUPP;
+
+    return RTL8366UB_MIB_COUNT;
+}
+
+static void rtl8366ub_sw_get_ethtool_stats(struct dsa_switch *ds, int port,
+                                           uint64_t *data)
+{
+    struct rtl8366ub_priv *priv = ds->priv;
+    rtksw_stat_counter_t val;
+    unsigned int i;
+
+    mutex_lock(&priv->reg_mutex);
+    for (i = 0; i < RTL8366UB_MIB_COUNT; i++) {
+        if (rtk_stat_port_get(port, rtl8366ub_mib_counters[i].idx,
+                              &val) == RT_ERR_OK)
+            data[i] = val;
+        else
+            data[i] = 0;
+    }
+    mutex_unlock(&priv->reg_mutex);
+}
+
+/*
  * Concurrency and MDIO-bus locking - verified correct, documented so neither
  * is "fixed" into a regression:
  *
@@ -817,6 +960,9 @@ static const struct dsa_switch_ops rtl8366ub_switch_ops = {
     .port_fdb_del = rtl8366ub_sw_port_fdb_del,
     .port_change_mtu = rtl8366ub_sw_port_change_mtu,
     .port_max_mtu = rtl8366ub_sw_port_max_mtu,
+    .get_strings = rtl8366ub_sw_get_strings,
+    .get_ethtool_stats = rtl8366ub_sw_get_ethtool_stats,
+    .get_sset_count = rtl8366ub_sw_get_sset_count,
 };
 
 static int port_isolation_show(struct seq_file *s, void *v)
@@ -838,14 +984,27 @@ static ssize_t phy_reg_read(struct file *file,
                             size_t count, loff_t *ppos)
 {
     char buf[256] = "";
-    int phy, reg, val;
+    unsigned int reg, val = 0;
+    int phy;
+    size_t len;
 
-    if (copy_from_user(buf, user_buf, min(count, sizeof(buf) - 1)))
+    len = min(count, sizeof(buf) - 1);
+    if (copy_from_user(buf, user_buf, len))
         return -EFAULT;
+    buf[len] = '\0';
 
-    sscanf(buf, "%d %x\n", &phy, (unsigned int *)&reg);
+    /* Expect "<phy> <hexreg>"; reject anything we cannot fully parse so we
+     * never hand stack garbage to the DAL nor print an uninitialised value.
+     * rtk_port_phyReg_get is a Clause-22 accessor (reg 0..0x1f), and 'val' is
+     * read into an rtksw_port_phy_data_t (unsigned int), not a signed int.
+     */
+    if (sscanf(buf, "%d %x", &phy, &reg) != 2)
+        return -EINVAL;
+    if (phy < 0 || phy >= RTL8366UB_NUM_PORTS || reg > 0x1f)
+        return -EINVAL;
 
-    rtk_port_phyReg_get(phy, reg, &val);
+    if (rtk_port_phyReg_get(phy, reg, &val) != RT_ERR_OK)
+        return -EIO;
 
     pr_info("phy: %d, reg: 0x%x = 0x%x\n", phy, reg, val);
 
@@ -980,4 +1139,3 @@ mdio_module_driver(rtl8366ub_mdio_driver);
 MODULE_AUTHOR("Jianhui Zhao <jianhui.zhao@gl-inet.com>");
 MODULE_DESCRIPTION("DSA driver for the RTL8371C (RTL8366UB) 2.5G switch");
 MODULE_LICENSE("GPL");
-

@@ -27,8 +27,14 @@ GitHub → **Actions** → **Build GL-MT5000 OpenWrt (DSA)** → **Run workflow*
 When it finishes, download the **`gl-mt5000-firmware`** artifact (kept 14 days).
 It contains:
 - `openwrt-mediatek-filogic-glinet_gl-mt5000-squashfs-sysupgrade.bin` — flash image
+- `...-squashfs-factory.bin` — U-Boot recovery install image (initial migration)
 - `...-initramfs-kernel.bin` — RAM-boot kernel for safe serial/U-Boot testing
 - `resolved.config`, `.manifest` — what was actually built
+
+> **First install from GL stock firmware:** this build carries standard OpenWrt
+> image metadata (`append-metadata`), not GL's. GL's stock upgrade page may
+> reject a non-GL image, so prefer the U-Boot recovery path with `factory.bin`
+> for the initial flash; use `sysupgrade -n` only once OpenWrt is running.
 
 ## Install / recovery
 
