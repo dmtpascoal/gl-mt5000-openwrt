@@ -14,6 +14,7 @@
 
 #include <linux/etherdevice.h>
 #include <linux/if_bridge.h>
+#include <linux/if_vlan.h>
 #include <linux/debugfs.h>
 #include <linux/of_mdio.h>
 #include <linux/of_net.h>
@@ -28,10 +29,22 @@
 #include "port.h"
 #include "vlan.h"
 #include "cpu.h"
+#include "l2.h"
 #include "rtl8366ub_dsa.h"
 #include "dal/smi.h"
 
 extern void rtk_set_mdc_mdio(struct mii_bus *bus, int id);
+
+/* Length of the Realtek rtl8_4 CPU tag inserted on the CPU/extension port
+ * (see net/dsa/tag_rtl8_4.c, RTL8_4_TAG_LEN).
+ */
+#define RTL8366UB_CPU_TAG_LEN	8
+
+/* Hardware per-port max frame length ceiling: RTL8371C_MAX_PACKET_LENGTH
+ * (0x3FEF) from the SDK DAL (dal/rtl8371c/dal_rtl8371c_port.h). The DAL
+ * rejects any rtk_port_maxPacketLength_set() above this value.
+ */
+#define RTL8366UB_MAX_PKT_LEN	0x3FEF
 
 static int rtl8366ub_find_cpu_port(struct dsa_switch *ds)
 {
@@ -170,6 +183,16 @@ static int rtl8366ub_sw_setup(struct dsa_switch *ds)
     rtk_port_isolation_set(EXT_PORT0, &portmask);
     rtk_port_isolation_set(priv->cpu_port, &portmask);
 
+    /* rtk_vlan_init() turns ingress VLAN filtering on for ALL valid ports,
+     * including the CPU/extension port. The setup loop above only clears it
+     * for the user ports (0..RTL8366UB_NUM_PORTS-1), and DSA only ever
+     * toggles .port_vlan_filtering on user ports - so the CPU port would stay
+     * filtered forever. The CPU port is a trunk that must accept every bridge
+     * VLAN (and CPU-injected frames); leave its ingress filter off. Egress is
+     * still governed by the per-VID member set programmed in port_vlan_add.
+     */
+    rtk_vlan_portIgrFilterEnable_set(priv->cpu_port, RTKSW_DISABLED);
+
     rtl8366ub_cpu_mac_config(ds, priv->cpu_port, interface);
     rtk_cpu_tagPort_set(priv->cpu_port, CPU_INSERT_TO_ALL);
     rtk_cpu_enable_set(RTKSW_ENABLED);
@@ -285,9 +308,20 @@ static int rtl8366ub_sw_port_bridge_join(struct dsa_switch *ds, int port,
                                          bool *tx_fwd_offload,
                                          struct netlink_ext_ack *extack)
 {
+    struct rtl8366ub_priv *priv = ds->priv;
     rtksw_portmask_t portmask_tmp;
     rtksw_portmask_t portmask;
     int i;
+
+    /* The isolation update is a read-modify-write spanning several SDK
+     * calls (rtk_port_isolation_get + _set). Hold reg_mutex so it cannot
+     * interleave with another port's join/leave or a vlan_add/del RMW,
+     * matching the locking already used in port_vlan_add/del. (rtnl_lock
+     * serializes these switchdev ops today, so this is robustness /
+     * consistency rather than an active race, but the SDK-level lock only
+     * makes each individual get/set atomic, not the get..set pair.)
+     */
+    mutex_lock(&priv->reg_mutex);
 
     rtk_port_isolation_get(port, &portmask);
 
@@ -309,15 +343,21 @@ static int rtl8366ub_sw_port_bridge_join(struct dsa_switch *ds, int port,
     /* Join each other port on the bridge to this port */
     rtk_port_isolation_set(port, &portmask);
 
+    mutex_unlock(&priv->reg_mutex);
+
     return 0;
 }
 
 static void rtl8366ub_sw_port_bridge_leave(struct dsa_switch *ds, int port,
                                            struct dsa_bridge bridge)
 {
+    struct rtl8366ub_priv *priv = ds->priv;
     rtksw_portmask_t portmask_tmp;
     rtksw_portmask_t portmask;
     int i;
+
+    /* See port_bridge_join: hold reg_mutex over the isolation get..set RMW. */
+    mutex_lock(&priv->reg_mutex);
 
     rtk_port_isolation_get(port, &portmask);
 
@@ -337,6 +377,8 @@ static void rtl8366ub_sw_port_bridge_leave(struct dsa_switch *ds, int port,
     }
 
     rtk_port_isolation_set(port, &portmask);
+
+    mutex_unlock(&priv->reg_mutex);
 }
 
 static int rtl8366ub_sw_port_vlan_add(struct dsa_switch *ds, int port,
@@ -491,6 +533,121 @@ static int rtl8366ub_sw_port_vlan_filtering(struct dsa_switch *ds, int port,
     return 0;
 }
 
+static void rtl8366ub_sw_port_fast_age(struct dsa_switch *ds, int port)
+{
+    struct rtl8366ub_priv *priv = ds->priv;
+    rtksw_l2_flushCfg_t cfg;
+
+    /* Flush only the dynamically-learned unicast entries on this port. The
+     * config is zero-initialised, so flushByVid/flushByFid/flushByMac stay
+     * disabled and the SDK takes the flush-by-port path; flushStaticAddr=0
+     * keeps static (bridge-offloaded) FDB entries intact. 'port' is the DSA
+     * index == SDK logical port and is L2P-mapped inside the DAL.
+     */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.flushByPort = RTKSW_ENABLED;
+    cfg.port = port;
+    cfg.flushStaticAddr = RTKSW_DISABLED;
+
+    mutex_lock(&priv->reg_mutex);
+    rtk_l2_ucastAddr_flush(&cfg);
+    mutex_unlock(&priv->reg_mutex);
+}
+
+static int rtl8366ub_sw_port_pre_bridge_flags(struct dsa_switch *ds, int port,
+                                              struct switchdev_brport_flags flags,
+                                              struct netlink_ext_ack *extack)
+{
+    /* Only per-port MAC learning can be toggled in hardware. */
+    if (flags.mask & ~(BR_LEARNING))
+        return -EINVAL;
+
+    return 0;
+}
+
+static int rtl8366ub_sw_port_bridge_flags(struct dsa_switch *ds, int port,
+                                          struct switchdev_brport_flags flags,
+                                          struct netlink_ext_ack *extack)
+{
+    struct rtl8366ub_priv *priv = ds->priv;
+    rtksw_api_ret_t ret = RT_ERR_OK;
+
+    if (flags.mask & BR_LEARNING) {
+        /* A per-port auto-learn limit of 0 disables SA learning; the chip's
+         * max LUT count re-enables it (mirrors rtl8365mb's learn-limit
+         * approach). maxLutAddrNumber_get() returns 0 before init, but this
+         * op only runs after setup() has completed rtk_switch_init().
+         */
+        mutex_lock(&priv->reg_mutex);
+        ret = rtk_l2_limitLearningCnt_set(port,
+                (flags.val & BR_LEARNING) ?
+                    rtksw_switch_maxLutAddrNumber_get(0) : 0);
+        mutex_unlock(&priv->reg_mutex);
+    }
+
+    return (ret == RT_ERR_OK) ? 0 : -EIO;
+}
+
+static int rtl8366ub_sw_port_fdb_add(struct dsa_switch *ds, int port,
+                                     const unsigned char *addr, u16 vid,
+                                     struct dsa_db db)
+{
+    struct rtl8366ub_priv *priv = ds->priv;
+    rtksw_l2_ucastAddr_t l2;
+    rtksw_mac_t mac;
+    rtksw_api_ret_t ret;
+
+    memcpy(mac.octet, addr, ETH_ALEN);
+
+    memset(&l2, 0, sizeof(l2));
+    l2.port = port;
+    l2.is_static = 1;
+    if (vid) {
+        l2.ivl = 1;             /* IVL: entry keyed on (MAC, cvid) */
+        l2.cvid = vid;
+    } else {
+        l2.ivl = 0;             /* SVL: entry keyed on (MAC, fid 0) */
+        l2.fid = 0;
+    }
+
+    mutex_lock(&priv->reg_mutex);
+    ret = rtk_l2_addr_add(&mac, &l2);
+    mutex_unlock(&priv->reg_mutex);
+
+    return (ret == RT_ERR_OK) ? 0 : -EIO;
+}
+
+static int rtl8366ub_sw_port_fdb_del(struct dsa_switch *ds, int port,
+                                     const unsigned char *addr, u16 vid,
+                                     struct dsa_db db)
+{
+    struct rtl8366ub_priv *priv = ds->priv;
+    rtksw_l2_ucastAddr_t l2;
+    rtksw_mac_t mac;
+    rtksw_api_ret_t ret;
+
+    memcpy(mac.octet, addr, ETH_ALEN);
+
+    memset(&l2, 0, sizeof(l2));
+    if (vid) {
+        l2.ivl = 1;
+        l2.cvid = vid;
+    } else {
+        l2.ivl = 0;
+        l2.fid = 0;
+    }
+
+    mutex_lock(&priv->reg_mutex);
+    ret = rtk_l2_addr_del(&mac, &l2);
+    mutex_unlock(&priv->reg_mutex);
+
+    /* A missing entry is not an error for an idempotent delete. */
+    if (ret == RT_ERR_OK || ret == RT_ERR_L2_ENTRY_NOTFOUND)
+        return 0;
+
+    return -EIO;
+}
+
 static void rtl8366ub_sw_phylink_mac_link_up(struct dsa_switch *ds, int port,
                                              unsigned int mode,
                                              phy_interface_t interface,
@@ -498,37 +655,144 @@ static void rtl8366ub_sw_phylink_mac_link_up(struct dsa_switch *ds, int port,
                                              int speed, int duplex,
                                              bool tx_pause, bool rx_pause)
 {
+    struct rtl8366ub_priv *priv = ds->priv;
     rtksw_port_mac_ability_t mac_cfg;
+    rtksw_port_linkStatus_t link = RTKSW_PORT_LINKDOWN;
+    rtksw_port_speed_t phy_speed = RTKSW_PORT_SPEED_1000M;
+    rtksw_port_duplex_t phy_duplex = RTKSW_PORT_FULL_DUPLEX;
+    bool resolved;
 
     if (port >= RTL8366UB_NUM_PORTS)
         return;
 
-    switch (speed) {
-        case SPEED_10:
-            mac_cfg.speed = RTKSW_PORT_SPEED_10M;
-            break;
-        case SPEED_100:
-            mac_cfg.speed = RTKSW_PORT_SPEED_100M;
-            break;
-        case SPEED_1000:
-            mac_cfg.speed = RTKSW_PORT_SPEED_1000M;
-            break;
-        case SPEED_2500:
-            mac_cfg.speed = RTKSW_PORT_SPEED_2500M;
-            break;
-        default:
-            mac_cfg.speed = RTKSW_PORT_SPEED_2500M;
+    memset(&mac_cfg, 0, sizeof(mac_cfg));
+
+    /*
+     * The user-port copper PHYs are driven by generic C22 phylib, which tops
+     * out at 1000BASE-T: the 2500BASE-T advertisement (OCP 0xA5D4) and
+     * resolution (OCP 0xA434) live in vendor OCP space that C22 genphy never
+     * reads, so @speed caps at 1000 even when the link actually ran at 2.5G.
+     * Read the chip's own resolved speed/duplex and force the switch MAC to
+     * the real rate; only fall back to auto-sync if that read fails (never
+     * force a stale 1000, which would silently cap the port).
+     */
+    mutex_lock(&priv->reg_mutex);
+    resolved = (rtk_port_phyStatus_get(port, &link, &phy_speed,
+                                       &phy_duplex) == RT_ERR_OK) &&
+               (link == RTKSW_PORT_LINKUP);
+
+    if (resolved) {
+        mac_cfg.forcemode = PORT_MAC_FORCE;
+        mac_cfg.speed = phy_speed;
+        mac_cfg.duplex = phy_duplex;
+    } else {
+        mac_cfg.forcemode = PORT_MAC_NORMAL;
+        switch (speed) {
+            case SPEED_10:   mac_cfg.speed = RTKSW_PORT_SPEED_10M; break;
+            case SPEED_100:  mac_cfg.speed = RTKSW_PORT_SPEED_100M; break;
+            case SPEED_2500: mac_cfg.speed = RTKSW_PORT_SPEED_2500M; break;
+            case SPEED_1000:
+            default:         mac_cfg.speed = RTKSW_PORT_SPEED_1000M; break;
+        }
+        mac_cfg.duplex = (duplex == DUPLEX_FULL) ?
+            RTKSW_PORT_FULL_DUPLEX : RTKSW_PORT_HALF_DUPLEX;
     }
-    mac_cfg.forcemode = PORT_MAC_NORMAL;
-    mac_cfg.duplex = duplex;
+
     mac_cfg.link = RTKSW_PORT_LINKUP;
     mac_cfg.nway = RTKSW_DISABLED;
     mac_cfg.txpause = tx_pause;
     mac_cfg.rxpause = rx_pause;
 
     rtk_port_macForceLink_set(port, &mac_cfg);
+    mutex_unlock(&priv->reg_mutex);
 }
 
+static int rtl8366ub_sw_port_change_mtu(struct dsa_switch *ds, int port,
+                                        int new_mtu)
+{
+    struct rtl8366ub_priv *priv = ds->priv;
+    rtksw_api_ret_t ret;
+    u32 frame_size;
+
+    /* MTU is the L3 payload; the switch polices the whole L2 frame, so add
+     * Ethernet + one VLAN tag + FCS overhead (1500 -> 1522).
+     */
+    frame_size = new_mtu + VLAN_ETH_HLEN + ETH_FCS_LEN;
+
+    /* Frames crossing the CPU/extension port additionally carry the 8-byte
+     * rtl8_4 DSA tag, so that port must accept the extra bytes. DSA drives
+     * this op for each user port (dp->index) and, via the MTU notifier, for
+     * the CPU port with cpu_mtu == largest user MTU (tag NOT included), so we
+     * add it here.
+     */
+    if (dsa_is_cpu_port(ds, port))
+        frame_size += RTL8366UB_CPU_TAG_LEN;
+
+    mutex_lock(&priv->reg_mutex);
+    ret = rtk_port_maxPacketLength_set(port, frame_size);
+    mutex_unlock(&priv->reg_mutex);
+
+    return (ret == RT_ERR_OK) ? 0 : -EIO;
+}
+
+static int rtl8366ub_sw_port_max_mtu(struct dsa_switch *ds, int port)
+{
+    /* Largest L3 MTU that still fits the hardware frame ceiling once the L2
+     * overhead and the rtl8_4 CPU tag are accounted for. DSA clamps this
+     * against the conduit's own max_mtu.
+     */
+    return RTL8366UB_MAX_PKT_LEN - VLAN_ETH_HLEN - ETH_FCS_LEN -
+           RTL8366UB_CPU_TAG_LEN;
+}
+
+/*
+ * Concurrency and MDIO-bus locking - verified correct, documented so neither
+ * is "fixed" into a regression:
+ *
+ *   (a) The SDK's global rtksw_api_mutex that serialises every rtk_*() call is
+ *       DEFINE_MUTEX(rtksw_api_mutex) at rtk_switch.c:35 (declared extern
+ *       struct mutex at rtk_switch.h:46). It is statically initialised - do
+ *       NOT add a mutex_init() for it and do NOT try to "cover" it with
+ *       priv->reg_mutex. In the kernel build RTK_X86_CLE is undefined, so
+ *       RTKSW_API_LOCK expands to mutex_lock(&rtksw_api_mutex) (not pthread):
+ *       every rtk_* entry point the driver calls holds it around register
+ *       access, so all chip access is globally serialised. Lock ordering is
+ *       consistent (priv->reg_mutex is always outer, rtksw_api_mutex always
+ *       inner) so there is no AB-BA deadlock.
+ *
+ *   (b) dal/smi.c holds __mii_bus->mdio_lock across the whole indirect
+ *       transaction (rtlglue_drvMutexLock -> mutex_lock(&__mii_bus->mdio_lock))
+ *       and issues it via the __mdiobus_* (unlocked) accessors - exactly the
+ *       in-tree realtek-mdio.c pattern. That is what keeps switch indirect
+ *       access atomic vs the WAN c45 PHY at mdio addr 15 on the shared bus.
+ *       Do NOT "simplify" smi.c to the self-locking mdiobus_read/write: that
+ *       would drop the lock between the address-latch write and the data read
+ *       and let the WAN-PHY poll corrupt the indirect access.
+ */
+
+/*
+ * CPU-tag / port-ID mapping - verified safe, documented so it is not "fixed"
+ * into a blackout:
+ *
+ * tag_rtl8_4 (DSA_TAG_PROTO_RTL8_4) carries the switch port in the DSA
+ * port-index number space: on RX it reads TX = source port and calls
+ * dsa_conduit_find_user(dev, 0, port) (matches dp->index); on TX it writes
+ * RX mask = BIT(dp->index). This mirrors the in-tree rtl8365mb driver, where
+ * dp->index IS the chip port number.
+ *
+ * On the RTL8371C the SDK logical<->physical map is the IDENTITY for the UTP
+ * ports: logical 0..3 -> physical 0..3. The two MT5000 user ports are DTS
+ * port@0 (lan1) and port@1 (lan2), i.e. dp->index 0/1 == chip physical 0/1.
+ * So the chip emits TX=0/1 for frames from lan1/lan2 and honours RX mask
+ * BIT(0)/BIT(1) to egress on lan1/lan2 - exactly what the tagger assumes.
+ *
+ * The CPU port is DTS port@17 = EXT_PORT1 (logical 17), which the SDK maps to
+ * physical 7. This logical!=physical divergence NEVER enters the tag TX/RX
+ * fields for user traffic (the CPU port is never a tag source or an xmit
+ * destination), so it is harmless. Do NOT "correct" the CPU port to reg=7:
+ * rtl8366ub_find_cpu_port() only accepts EXT_PORT0(16)/EXT_PORT1(17), and the
+ * SDK performs the 17->7 translation internally.
+ */
 static const struct dsa_switch_ops rtl8366ub_switch_ops = {
     .get_tag_protocol = rtl8366ub_sw_get_tag_protocol,
     .setup = rtl8366ub_sw_setup,
@@ -546,6 +810,13 @@ static const struct dsa_switch_ops rtl8366ub_switch_ops = {
     .phylink_mac_config = rtl8366ub_sw_phylink_mac_config,
     .phylink_mac_link_down = rtl8366ub_sw_phylink_mac_link_down,
     .phylink_mac_link_up = rtl8366ub_sw_phylink_mac_link_up,
+    .port_fast_age = rtl8366ub_sw_port_fast_age,
+    .port_pre_bridge_flags = rtl8366ub_sw_port_pre_bridge_flags,
+    .port_bridge_flags = rtl8366ub_sw_port_bridge_flags,
+    .port_fdb_add = rtl8366ub_sw_port_fdb_add,
+    .port_fdb_del = rtl8366ub_sw_port_fdb_del,
+    .port_change_mtu = rtl8366ub_sw_port_change_mtu,
+    .port_max_mtu = rtl8366ub_sw_port_max_mtu,
 };
 
 static int port_isolation_show(struct seq_file *s, void *v)
@@ -613,6 +884,12 @@ static int rtl8366ub_mdio_probe(struct mdio_device *mdiodev)
     priv->dev = &mdiodev->dev;
     priv->mdio_addr = mdiodev->addr;
     mutex_init(&priv->reg_mutex);
+    /*
+     * NOTE: the SDK's global rtksw_api_mutex that serialises every rtk_*()
+     * call is a DEFINE_MUTEX() in rtk_switch.c (statically initialised) - do
+     * NOT add a mutex_init() for it. There is no uninitialised-mutex/crash
+     * risk here.
+     */
     dev_set_drvdata(&mdiodev->dev, priv);
 
     priv->ds->dev = &mdiodev->dev;
@@ -631,6 +908,14 @@ static int rtl8366ub_mdio_probe(struct mdio_device *mdiodev)
      * chip VLAN table from the bridge's view.
      */
     priv->ds->configure_vlan_while_not_filtering = true;
+
+    /* The rtl8_4 tagger sets LEARN_DIS on every CPU-injected frame
+     * (tag_rtl8_4.c), so the switch never learns the router/host MAC by
+     * itself and would flood all replies. Let DSA software-learn conduit
+     * source MACs and install them as static entries via .port_fdb_add on
+     * the CPU port.
+     */
+    priv->ds->assisted_learning_on_cpu_port = true;
 
     rtk_set_mdc_mdio(priv->bus, priv->mdio_addr);
 
